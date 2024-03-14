@@ -69,7 +69,8 @@ class ModelArguments:
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
     mm_vision_select_feature: Optional[str] = field(default="patch")
-
+    load_pt_cfg_only: Optional[str] = field(default=None)
+    load_pt_model_only: Optional[str] = field(default=None)
 
 @dataclass
 class DataArguments:
@@ -641,16 +642,33 @@ def preprocess(
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str,
+    def __init__(self,
+                 data_args: DataArguments,
                  tokenizer: transformers.PreTrainedTokenizer,
-                 data_args: DataArguments):
+                 ):
         super(LazySupervisedDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
-        self.list_data_dict = list_data_dict
         self.data_args = data_args
+        self.load_data_list()
+
+    def load_data_list(self):
+        data_path_list = [i.strip() for i in self.data_args.data_path.split(',')]
+        data_path_list = [x for x in data_path_list if x != ""]
+
+        image_folder_list = [i.strip() for i in self.data_args.image_folder.split(',')]
+        image_folder_list = [x for x in image_folder_list if x != ""]
+
+        list_data_dict = []
+        for data_path, image_folder in zip(data_path_list, image_folder_list):
+            assert os.path.exists(data_path), f"Dataset {data_path} does not exist!"
+            list_data = json.load(open(data_path, "r"))
+            for sample in list_data:
+                if 'image' in sample:
+                    sample['image'] = os.path.join(image_folder, sample['image'])
+            list_data_dict.extend(list_data)
+        self.list_data_dict = list_data_dict
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -694,11 +712,10 @@ class LazySupervisedDataset(Dataset):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         if 'image' in sources[0]:
-            image_file = self.list_data_dict[i]['image']
-            image_folder = self.data_args.image_folder
+            image_path = self.list_data_dict[i]['image']
             processor = self.data_args.image_processor
             # image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
-            image = self.load_image(image_file, image_folder)
+            image = Image.open(image_path).convert('RGB')
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -783,23 +800,18 @@ def build_dataset(data_args, tokenizer, dataset_cls):
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    dataset_cls = LazySupervisedDataset
+    # dataset_cls = LazySupervisedDataset
+    # #  concat data files
+    # data_path = data_args.data_path
+    # data_path_list = [i.strip() for i in data_path.split(',')]
+    # data_path_list = [x for x in data_path_list if x != ""]
+    # train_dataset = build_concat_dataset(data_path_list, data_args, tokenizer)
 
-
-    #  concat data files
-    data_path = data_args.data_path
-    data_path_list = [i.strip() for i in data_path.split(',')]
-    data_path_list = [x for x in data_path_list if x != ""]
-
-    data_set_list = []
-    for data_name in data_path_list:
-        assert os.path.exists(data_name), f"{data_name} does not exist"
-        new_data_args = copy.deepcopy(data_args)
-        new_data_args.data_path = data_name
-        train_dataset_i = build_dataset(new_data_args, tokenizer, dataset_cls)
-        data_set_list.append(train_dataset_i)
-    train_dataset = ConcatDataset(data_set_list)
-    print(f"train_dataset size: {len(train_dataset)}")
+    train_dataset = LazySupervisedDataset(data_args, tokenizer)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    return dict(train_dataset=train_dataset,
+                eval_dataset=None,
+                data_collator=data_collator)
 
 
 def train():
@@ -841,11 +853,31 @@ def train():
                 **bnb_model_from_pretrained_args
             )
         else:
-            model = LlavaLlamaForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
-                **bnb_model_from_pretrained_args
-            )
+            if model_args.load_pt_cfg_only:
+                print(f"LOAD ONLY CONFIG, from: {model_args.load_pt_cfg_only}")
+                config = LlavaConfig.from_pretrained(model_args.load_pt_cfg_only)
+                if model_args.load_pt_model_only:
+                    print(f"LOAD ONLY MODEL WEIGHTS, from: {model_args.load_pt_model_only}")
+                    model = LlavaLlamaForCausalLM.from_pretrained(
+                        model_args.load_pt_model_only,
+                        config=config,
+                        cache_dir=training_args.cache_dir,
+                        **bnb_model_from_pretrained_args
+                    )
+                else:
+                    # init random weights
+                    print(f"RANDOM INIT MODEL WEIGHTS!!")
+                    model = LlavaLlamaForCausalLM._from_config(
+                        config,
+                        cache_dir=training_args.cache_dir,
+                        **bnb_model_from_pretrained_args
+                    )
+            else:
+                model = LlavaLlamaForCausalLM.from_pretrained(
+                    model_args.model_name_or_path,
+                    cache_dir=training_args.cache_dir,
+                    **bnb_model_from_pretrained_args
+                )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -896,8 +928,12 @@ def train():
             padding_side="right"
         )
     else:
+        token_cfg_dir = model_args.load_pt_cfg_only if model_args.load_pt_cfg_only is not None \
+            else model_args.model_name_or_path
+        print(f"TOKEN_CFG_DIR={token_cfg_dir}")
+
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
+            token_cfg_dir,
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
             padding_side="right",
@@ -955,6 +991,11 @@ def train():
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+
+    # for n, p in model.named_parameters():
+    #     print(f"model param name={n}, param size={p.size()}")
+    # import sys
+    # sys.exit(0)
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
