@@ -661,12 +661,21 @@ class LazySupervisedDataset(Dataset):
         image_folder_list = [x for x in image_folder_list if x != ""]
 
         list_data_dict = []
-        for data_path, image_folder in zip(data_path_list, image_folder_list):
+        for data_path in data_path_list:
             assert os.path.exists(data_path), f"Dataset {data_path} does not exist!"
             list_data = json.load(open(data_path, "r"))
             for sample in list_data:
                 if 'image' in sample:
-                    sample['image'] = os.path.join(image_folder, sample['image'])
+                    full_img_path = None
+                    # search for image path in image_folder_list
+                    for dirname in image_folder_list:
+                        img_path = os.path.join(dirname, sample['image'])
+                        if (os.path.exists(img_path)):
+                            full_img_path = img_path
+                            break
+                    for full_img_path is None:
+                        raise ValueError(f"No valid image path for {sample['image']}")
+                    sample['image'] = full_img_path
             list_data_dict.extend(list_data)
         self.list_data_dict = list_data_dict
 
